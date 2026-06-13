@@ -1,0 +1,37 @@
+# Environment and secrets
+.env
+server/.env
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+server/.venv/
+extension/.venv/
+.venv/
+
+# Node / Vite
+node_modules/
+extension/node_modules/
+extension/dist/
+*.tsbuildinfo
+*.d.ts.map
+extension/vite.config.js
+extension/vite.config.d.ts
+extension/src/manifest.js
+extension/src/manifest.d.ts
+
+# Runtime cache and generated exports
+server/static/cache_data/
+server/static/exports/
+server/app/static/cache_data/
+server/app/static/exports/
+
+# Logs and local editor files
+*.log
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
