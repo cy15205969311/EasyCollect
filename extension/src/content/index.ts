@@ -407,9 +407,21 @@ function readShopeeSsrData(): CachedShopeeData | undefined {
     capturedAt: new Date().toISOString(),
     raw: {
       platform: "shopee",
+      dom_price: readShopeeDomPrice(),
       data: matched.item,
     },
   };
+}
+
+function readShopeeDomPrice(): string {
+  if (detectPlatform() !== "shopee") {
+    return "";
+  }
+
+  const text = document.body?.innerText || "";
+  const pricePattern = /\b(?:RM|MYR)\s*\d+(?:[.,]\d{1,2})?(?:\s*[-–~]\s*(?:RM|MYR)?\s*\d+(?:[.,]\d{1,2})?)?/i;
+  const matched = text.match(pricePattern);
+  return matched?.[0]?.trim() || "";
 }
 
 function requestExtraction(aiMode: boolean): Promise<StartExtractionResponse> {
@@ -460,7 +472,11 @@ window.addEventListener("message", (event: MessageEvent<ShopeeApiMessage>) => {
     dataKey: "network_interceptor",
     url: event.data.url ?? window.location.href,
     capturedAt: event.data.capturedAt ?? new Date().toISOString(),
-    raw: event.data.payload,
+    raw: {
+      platform: "shopee",
+      dom_price: readShopeeDomPrice(),
+      data: event.data.payload,
+    },
   };
 
   console.info("[EasyCollect] cached Shopee API payload:", event.data.url);

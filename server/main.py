@@ -444,6 +444,50 @@ def normalize_shopee_price_range(price_min: Any, price_max: Any) -> str | None:
     return min_price or max_price
 
 
+def normalize_shopee_dom_price(value: Any) -> str | None:
+    """Normalize visible Shopee price text such as ``RM5.40 - RM10.00``."""
+
+    if not isinstance(value, str):
+        return None
+
+    prices = [
+        parse_standard_price(match.group(0))
+        for match in re.finditer(r"\d+(?:[.,]\d+)?", value.replace(",", ""))
+    ]
+    clean_prices = [price for price in prices if price is not None]
+    if not clean_prices:
+        return None
+
+    min_price = min(clean_prices)
+    max_price = max(clean_prices)
+    if min_price == max_price:
+        return format_standard_price(min_price)
+
+    return f"{format_standard_price(min_price)}-{format_standard_price(max_price)}"
+
+
+def extract_shopee_dom_price(raw_data: Any, item: dict[str, Any]) -> str | None:
+    """Read Shopee DOM price fallback from wrapped frontend payloads."""
+
+    candidates: list[Any] = [item.get("dom_price"), item.get("display_price")]
+    if isinstance(raw_data, dict):
+        candidates.extend(
+            [
+                raw_data.get("dom_price"),
+                raw_data.get("display_price"),
+                safe_get(raw_data, ["data", "dom_price"]),
+                safe_get(raw_data, ["data", "display_price"]),
+            ]
+        )
+
+    for candidate in candidates:
+        price = normalize_shopee_dom_price(candidate)
+        if price:
+            return price
+
+    return None
+
+
 def extract_shopee_base_price(item: dict[str, Any]) -> str | None:
     """Extract Shopee product-level price from common single/range fields."""
 
@@ -1924,6 +1968,8 @@ def extract_shopee_data(raw_data: dict[str, Any]) -> dict[str, Any]:
     price = extract_shopee_base_price(item_data)
     if is_missing_base_price(price):
         price = infer_price_range_from_skus(sku_list)
+    if is_missing_base_price(price):
+        price = extract_shopee_dom_price(raw_data, item_data)
 
     clean_data = {
         "title": title or "",

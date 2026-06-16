@@ -467,8 +467,15 @@ function extractProductData(): ExtractedProductData {
         description,
         images: image ? [image] : [],
       },
+      dom_price: readShopeeDomPrice(),
       domFallback: true,
     };
+  }
+
+  function readShopeeDomPrice(): string {
+    const text = document.body?.innerText || "";
+    const pricePattern = /\b(?:RM|MYR)\s*\d+(?:[.,]\d{1,2})?(?:\s*[-–~]\s*(?:RM|MYR)?\s*\d+(?:[.,]\d{1,2})?)?/i;
+    return text.match(pricePattern)?.[0]?.trim() || "";
   }
 
   function extractShopeeProductData(): ExtractedProductData {
@@ -539,13 +546,15 @@ function extractProductData(): ExtractedProductData {
 
     const matched = candidates.sort((left, right) => right.score - left.score)[0];
     const raw = toPlainData(matched?.payload ?? buildShopeeDomFallback());
+    const rawRecord = isPlainObject(raw) ? raw : { data: raw };
+    rawRecord.dom_price = readShopeeDomPrice();
 
     return {
       dataKey: matched?.dataKey ?? "dom_fallback",
       platform: "shopee",
-      title: pickTitle(raw),
-      images: pickImages(raw),
-      raw,
+      title: pickTitle(rawRecord),
+      images: pickImages(rawRecord),
+      raw: rawRecord,
     };
   }
 
