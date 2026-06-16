@@ -20,6 +20,7 @@ declare namespace chrome {
     };
 
     function sendMessage(message: any, callback?: (response?: unknown) => void): void;
+    function getURL(path: string): string;
   }
 
   namespace scripting {
@@ -39,6 +40,13 @@ declare namespace chrome {
 
   namespace tabs {
     function sendMessage(tabId: number, message: any): Promise<unknown>;
+    function create(
+      createProperties: {
+        url?: string;
+        active?: boolean;
+      },
+      callback?: (tab?: { id?: number; url?: string }) => void,
+    ): void;
   }
 
   namespace downloads {

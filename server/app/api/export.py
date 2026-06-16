@@ -14,6 +14,9 @@ from urllib.parse import quote
 import httpx
 from fastapi import APIRouter, BackgroundTasks, HTTPException
 from fastapi.responses import FileResponse
+from pydantic import BaseModel, Field
+
+from app import product_store
 
 
 BASE_DIR = Path(__file__).resolve().parents[2]
@@ -25,9 +28,29 @@ OPTIMIZED_PRODUCT_PATH = CACHE_DIR / "optimized_product.json"
 MAIN_IMAGE_DIR_NAME = "01_\u4e3b\u56fe"
 SKU_IMAGE_DIR_NAME = "02_\u53d8\u4f53\u56fe"
 COPY_FILE_NAME = "03_\u5546\u54c1\u6587\u6848.txt"
-SKU_CSV_FILE_NAME = "04_\u53d8\u4f53\u5e93\u5b58\u8868.csv"
+SKU_CSV_FILE_NAME = "05_\u53d8\u4f53\u5e93\u5b58\u8868.csv"
+SHOPEE_CSV_FILE_NAME = "04_Shopee\u6279\u91cf\u4e0a\u67b6\u8868.csv"
 MAIN_IMAGE_PREFIX = "\u4e3b\u56fe"
 CSV_HEADERS = ["\u89c4\u683c\u540d\u79f0", "\u4ef7\u683c", "\u5e93\u5b58", "\u5173\u8054\u56fe\u7247\u540d"]
+SHOPEE_CSV_HEADERS = [
+    "\u5546\u54c1\u5206\u7c7b (Category ID)",
+    "\u5546\u54c1\u540d\u79f0 (Product Name)",
+    "\u5546\u54c1\u63cf\u8ff0 (Product Description)",
+    "\u4ef7\u683c (Price)",
+    "\u5e93\u5b58 (Stock)",
+    "\u4e3bSKU (Parent SKU)",
+    "\u9009\u9879\u540d\u79f0 (Variation Name)",
+    "\u9009\u9879\u56fe\u7247 (Variation Image)",
+    "\u5546\u54c1\u4e3b\u56fe1 (Cover Image)",
+    "\u5546\u54c1\u4e3b\u56fe2 (Image 2)",
+    "\u5546\u54c1\u4e3b\u56fe3 (Image 3)",
+    "\u5546\u54c1\u4e3b\u56fe4 (Image 4)",
+    "\u5546\u54c1\u4e3b\u56fe5 (Image 5)",
+    "\u5546\u54c1\u4e3b\u56fe6 (Image 6)",
+    "\u5546\u54c1\u4e3b\u56fe7 (Image 7)",
+    "\u5546\u54c1\u4e3b\u56fe8 (Image 8)",
+    "\u5546\u54c1\u4e3b\u56fe9 (Image 9)",
+]
 
 router = APIRouter()
 logger = logging.getLogger("easycollect")
@@ -40,6 +63,12 @@ class ExportPackage:
     zip_path: Path
     filename: str
     download_url: str
+
+
+class BulkExportRequest(BaseModel):
+    """Product ids selected in the dashboard for one ZIP export."""
+
+    product_ids: list[str] = Field(default_factory=list)
 
 
 def sanitize_filename(value: str, fallback: str = "product") -> str:
@@ -188,6 +217,122 @@ def get_sku_list(product: dict[str, Any]) -> list[dict[str, Any]]:
     return [sku for sku in product.get("sku_list", []) if isinstance(sku, dict)]
 
 
+def get_base_price(product: dict[str, Any]) -> str:
+    """Read a fallback product price from base price or the first priced SKU.
+
+    Args:
+        product: Product JSON loaded from local cache.
+
+    Returns:
+        Price string when available, otherwise an empty string.
+    """
+
+    base_price = normalize_csv_price(product.get("base_price"), allow_range=True)
+    if base_price:
+        return base_price
+
+    for sku in get_sku_list(product):
+        price = normalize_csv_price(sku.get("price"))
+        if price:
+            return price
+
+    return ""
+
+
+def parse_csv_price(value: Any) -> float | None:
+    """Parse normalized or raw marketplace prices for CSV-safe output."""
+
+    if value in (None, "", [], {}):
+        return None
+
+    if isinstance(value, (int, float)):
+        number = float(value)
+    else:
+        cleaned = str(value).strip().lower()
+        if cleaned in {"not found", "none", "null", "nan", "0", "0.0", "0.00"}:
+            return None
+
+        match = re.search(r"\d+(?:[.,]\d+)?", cleaned.replace(",", ""))
+        if not match:
+            return None
+
+        try:
+            number = float(match.group(0))
+        except ValueError:
+            return None
+
+    if number <= 0:
+        return None
+
+    if number >= 100000:
+        number = number / 100000
+
+    return number
+
+
+def normalize_csv_price(value: Any, allow_range: bool = False) -> str:
+    """Format a price for Shopee CSV, correcting raw 100000x Shopee values."""
+
+    if allow_range and isinstance(value, str) and "-" in value:
+        prices = [parse_csv_price(part) for part in value.split("-", 1)]
+        if prices[0] is not None and prices[1] is not None:
+            if prices[0] == prices[1]:
+                return f"{prices[0]:.2f}"
+            return f"{prices[0]:.2f}-{prices[1]:.2f}"
+
+    price = parse_csv_price(value)
+    return "" if price is None else f"{price:.2f}"
+
+
+def build_product_description(product: dict[str, Any]) -> str:
+    """Build import-friendly product description for Shopee CSV rows.
+
+    Args:
+        product: Parsed or optimized product data.
+
+    Returns:
+        A compact description using AI copy when available, otherwise a safe
+        fallback based on the product title.
+    """
+
+    title = get_product_title(product)
+    marketing_copy = product.get("marketing_copy")
+    bullet_points = product.get("bullet_points", [])
+    lines: list[str] = []
+
+    if isinstance(marketing_copy, str) and marketing_copy.strip():
+        lines.append(marketing_copy.strip())
+    else:
+        lines.append(f"{title}\n\u5546\u54c1\u4fe1\u606f\u5df2\u7531 EasyCollect \u91c7\u96c6\u6e05\u6d17\uff0c\u8bf7\u5728\u4e0a\u67b6\u524d\u6838\u5bf9\u89c4\u683c\u3001\u4ef7\u683c\u548c\u5e93\u5b58\u3002")
+
+    if isinstance(bullet_points, list):
+        clean_points = [
+            str(point).strip()
+            for point in bullet_points
+            if str(point).strip()
+        ]
+        if clean_points:
+            lines.append("")
+            lines.extend(f"- {point}" for point in clean_points)
+
+    return "\n".join(lines).strip()
+
+
+def build_parent_sku(title: str) -> str:
+    """Create a stable-looking parent SKU prefix for Shopee import rows.
+
+    Args:
+        title: Product title.
+
+    Returns:
+        Parent SKU string.
+    """
+
+    safe_title = sanitize_filename(title, "product").upper()
+    safe_title = re.sub(r"[^A-Z0-9_]+", "_", safe_title)
+    return f"EC_{safe_title[:24]}_{uuid.uuid4().hex[:6].upper()}"
+
+
 async def download_image(
     client: httpx.AsyncClient,
     semaphore: asyncio.Semaphore,
@@ -322,11 +467,111 @@ def write_sku_csv(
             writer.writerow(
                 {
                     CSV_HEADERS[0]: sku.get("spec_name", ""),
-                    CSV_HEADERS[1]: sku.get("price", ""),
+                    CSV_HEADERS[1]: normalize_csv_price(sku.get("price")),
                     CSV_HEADERS[2]: sku.get("stock", ""),
                     CSV_HEADERS[3]: sku_image_files.get(sku_image, ""),
                 }
             )
+
+
+def write_shopee_upload_csv(
+    product: dict[str, Any],
+    output_path: Path,
+) -> None:
+    """Write a Shopee bulk-upload CSV into the export package.
+
+    The CSV keeps a fixed column layout even when variation images are missing
+    or the product has fewer than nine main images. Rows are flattened from the
+    SKU list so users can import or refine them in Shopee Seller Center.
+
+    Args:
+        product: Parsed or optimized product data.
+        output_path: Destination CSV path.
+    """
+
+    title = get_product_title(product)
+    description = build_product_description(product)
+    base_price = get_base_price(product)
+    parent_sku = build_parent_sku(title)
+    main_images = get_main_images(product)[:9]
+    main_image_columns = {
+        SHOPEE_CSV_HEADERS[index + 8]: main_images[index] if index < len(main_images) else ""
+        for index in range(9)
+    }
+    sku_list = get_sku_list(product) or [
+        {
+            "spec_name": "",
+            "price": base_price,
+            "stock": "1",
+            "sku_image": "",
+        }
+    ]
+
+    with output_path.open("w", encoding="utf-8-sig", newline="") as file:
+        writer = csv.DictWriter(file, fieldnames=SHOPEE_CSV_HEADERS)
+        writer.writeheader()
+
+        for sku in sku_list:
+            sku_price = normalize_csv_price(sku.get("price")) or base_price
+            sku_stock = str(sku.get("stock") or "0").strip()
+            sku_image = normalize_url(str(sku.get("sku_image") or ""))
+            row = {
+                SHOPEE_CSV_HEADERS[0]: "",
+                SHOPEE_CSV_HEADERS[1]: title,
+                SHOPEE_CSV_HEADERS[2]: description,
+                SHOPEE_CSV_HEADERS[3]: sku_price,
+                SHOPEE_CSV_HEADERS[4]: sku_stock,
+                SHOPEE_CSV_HEADERS[5]: parent_sku,
+                SHOPEE_CSV_HEADERS[6]: sku.get("spec_name", ""),
+                SHOPEE_CSV_HEADERS[7]: sku_image,
+                **main_image_columns,
+            }
+            writer.writerow(row)
+
+
+def write_bulk_shopee_upload_csv(
+    products: list[dict[str, Any]],
+    output_path: Path,
+) -> None:
+    """Write one Shopee upload CSV containing multiple selected products."""
+
+    with output_path.open("w", encoding="utf-8-sig", newline="") as file:
+        writer = csv.DictWriter(file, fieldnames=SHOPEE_CSV_HEADERS)
+        writer.writeheader()
+
+        for product in products:
+            title = get_product_title(product)
+            description = build_product_description(product)
+            base_price = get_base_price(product)
+            parent_sku = build_parent_sku(title)
+            main_images = get_main_images(product)[:9]
+            main_image_columns = {
+                SHOPEE_CSV_HEADERS[index + 8]: main_images[index] if index < len(main_images) else ""
+                for index in range(9)
+            }
+            sku_list = get_sku_list(product) or [
+                {
+                    "spec_name": "",
+                    "price": base_price,
+                    "stock": "1",
+                    "sku_image": "",
+                }
+            ]
+
+            for sku in sku_list:
+                writer.writerow(
+                    {
+                        SHOPEE_CSV_HEADERS[0]: "",
+                        SHOPEE_CSV_HEADERS[1]: title,
+                        SHOPEE_CSV_HEADERS[2]: description,
+                        SHOPEE_CSV_HEADERS[3]: normalize_csv_price(sku.get("price")) or base_price,
+                        SHOPEE_CSV_HEADERS[4]: str(sku.get("stock") or "0").strip(),
+                        SHOPEE_CSV_HEADERS[5]: parent_sku,
+                        SHOPEE_CSV_HEADERS[6]: sku.get("spec_name", ""),
+                        SHOPEE_CSV_HEADERS[7]: normalize_url(str(sku.get("sku_image") or "")),
+                        **main_image_columns,
+                    }
+                )
 
 
 def make_zip(source_dir: Path, zip_path: Path) -> Path:
@@ -442,6 +687,7 @@ async def build_export_package(product: dict[str, Any], optimized: bool = False)
 
     write_marketing_copy(product, work_dir / COPY_FILE_NAME, optimized)
     write_sku_csv(sku_list, work_dir / SKU_CSV_FILE_NAME, sku_image_files)
+    write_shopee_upload_csv(product, work_dir / SHOPEE_CSV_FILE_NAME)
     make_zip(work_dir, zip_path)
     cleanup_export([work_dir])
 
@@ -452,6 +698,75 @@ async def build_export_package(product: dict[str, Any], optimized: bool = False)
         len(main_jobs),
         len(sku_image_files),
         len(sku_jobs),
+    )
+
+    return ExportPackage(
+        zip_path=zip_path,
+        filename=zip_path.name,
+        download_url=public_download_url(zip_path),
+    )
+
+
+async def build_bulk_export_package(products: list[dict[str, Any]]) -> ExportPackage:
+    """Build one ZIP package for multiple selected product-library rows."""
+
+    if not products:
+        raise HTTPException(status_code=400, detail="No products selected for export.")
+
+    EXPORT_DIR.mkdir(parents=True, exist_ok=True)
+
+    export_id = uuid.uuid4().hex[:10]
+    work_dir = EXPORT_DIR / f"bulk_temp_{export_id}"
+    zip_path = EXPORT_DIR / f"EasyCollect_Bulk_{export_id}.zip"
+    work_dir.mkdir(parents=True, exist_ok=True)
+
+    image_jobs: list[tuple[str, Path]] = []
+    seen_destinations: set[Path] = set()
+
+    for product_index, product in enumerate(products, start=1):
+        title = get_product_title(product)
+        product_dir = work_dir / f"{product_index:02d}_{sanitize_filename(title)}"
+        main_image_dir = product_dir / MAIN_IMAGE_DIR_NAME
+        sku_image_dir = product_dir / SKU_IMAGE_DIR_NAME
+        main_image_dir.mkdir(parents=True, exist_ok=True)
+        sku_image_dir.mkdir(parents=True, exist_ok=True)
+
+        for image_index, url in enumerate(get_main_images(product), start=1):
+            destination = main_image_dir / f"{MAIN_IMAGE_PREFIX}_{image_index}{image_extension(url)}"
+            if destination not in seen_destinations:
+                seen_destinations.add(destination)
+                image_jobs.append((url, destination))
+
+        seen_sku_images: set[str] = set()
+        for sku in get_sku_list(product):
+            raw_url = sku.get("sku_image")
+            if not isinstance(raw_url, str):
+                continue
+
+            url = normalize_url(raw_url)
+            if not url or url in seen_sku_images:
+                continue
+
+            seen_sku_images.add(url)
+            spec_name = sanitize_filename(str(sku.get("spec_name") or "sku_image"), "sku_image")
+            destination = sku_image_dir / f"{spec_name}{image_extension(url)}"
+            if destination not in seen_destinations:
+                seen_destinations.add(destination)
+                image_jobs.append((url, destination))
+
+        write_marketing_copy(product, product_dir / COPY_FILE_NAME, bool(product.get("title_optimized")))
+        write_sku_csv(get_sku_list(product), product_dir / SKU_CSV_FILE_NAME, {})
+
+    await download_images(image_jobs)
+    write_bulk_shopee_upload_csv(products, work_dir / SHOPEE_CSV_FILE_NAME)
+    make_zip(work_dir, zip_path)
+    cleanup_export([work_dir])
+
+    logger.info(
+        "Bulk export package generated: %s (products=%s, image_jobs=%s)",
+        zip_path,
+        len(products),
+        len(image_jobs),
     )
 
     return ExportPackage(
@@ -482,3 +797,36 @@ async def download_export_package(background_tasks: BackgroundTasks) -> FileResp
         media_type="application/zip",
         filename=package.filename,
     )
+
+
+@router.post("/api/export/bulk")
+async def export_bulk_products(
+    payload: BulkExportRequest,
+    background_tasks: BackgroundTasks,
+) -> dict[str, str]:
+    """Build a ZIP package for selected product-library items."""
+
+    product_ids = [product_id for product_id in payload.product_ids if product_id]
+    if not product_ids:
+        raise HTTPException(status_code=400, detail="Please select at least one product.")
+
+    products = product_store.get_products(product_ids)
+    if not products:
+        raise HTTPException(status_code=404, detail="Selected products were not found.")
+
+    platforms = {
+        str(product.get("platform") or "Unknown").strip().lower()
+        for product in products
+    }
+    platforms.discard("")
+    if len(platforms) > 1:
+        raise HTTPException(status_code=400, detail="跨平台数据无法合并导出")
+
+    package = await build_bulk_export_package(products)
+    background_tasks.add_task(cleanup_export_later, [package.zip_path])
+
+    return {
+        "status": "success",
+        "download_url": package.download_url,
+        "filename": package.filename,
+    }

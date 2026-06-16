@@ -6,6 +6,14 @@ import manifest from "./src/manifest";
 
 export default defineConfig({
   plugins: [vue(), crx({ manifest })],
+  build: {
+    rollupOptions: {
+      input: {
+        popup: new URL("./index.html", import.meta.url).pathname,
+        dashboard: new URL("./dashboard.html", import.meta.url).pathname,
+      },
+    },
+  },
   server: {
     port: 5173,
     strictPort: true,

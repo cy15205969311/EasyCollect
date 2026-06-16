@@ -1,20 +1,21 @@
-import json
+﻿import json
 import logging
+import re
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 from html import unescape
 
-from fastapi import BackgroundTasks, FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
-from app.api.export import (
-    build_export_package,
-    cleanup_export_later,
-    router as export_router,
-)
+from app import product_store
+from app.api.export import router as export_router
 from app.api.optimize import optimize_parsed_product, router as optimize_router
+from app.api.shopee import router as shopee_router
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -23,6 +24,7 @@ CACHE_DATA_DIR = BASE_DIR / "static" / "cache_data"
 RAW_PAYLOAD_PATH = CACHE_DATA_DIR / "raw_payload.json"
 PARSED_PRODUCT_PATH = CACHE_DATA_DIR / "parsed_product.json"
 logger = logging.getLogger("easycollect")
+SHOPEE_IMAGE_BASE_URL = "https://cf.shopee.com.my/file/"
 
 
 class HealthResponse(BaseModel):
@@ -53,6 +55,8 @@ class CollectRequest(BaseModel):
             ``__pageData__``.
         title: Best-effort product title extracted by the content script.
         images: Best-effort product image URLs extracted by the content script.
+        platform: Platform detected by the extension, such as ``1688`` or
+            ``shopee``.
         ai_mode: Whether Kiro Agent copy optimization should run before export.
         raw: Raw frontend JSON object collected from the product page. The Agent
             workflow will reduce and normalize this payload in later steps.
@@ -62,6 +66,7 @@ class CollectRequest(BaseModel):
     url: str
     capturedAt: str
     dataKey: str | None = None
+    platform: str | None = None
     title: str | None = None
     images: list[str] = Field(default_factory=list)
     ai_mode: bool = False
@@ -79,19 +84,33 @@ class CollectResponse(BaseModel):
         price: Parsed product reference price from the raw 1688 payload.
         raw_file: Local debug JSON file path where the latest raw payload is saved.
         parsed_file: Local debug JSON file path for the cleaned product summary.
-        download_url: Browser-accessible URL for the generated ERP ZIP package.
-        optimized: Whether the export ZIP was built with Kiro Agent copy.
+        product_id: Product-library id for the saved inbox item.
+        optimized: Whether Kiro Agent copy was applied before saving.
     """
 
     status: str
     msg: str
+    message: str | None = None
     title: str | None = None
     images: list[str] = Field(default_factory=list)
     price: str | int | float | None = None
+    product_id: str | None = None
     raw_file: str | None = None
     parsed_file: str | None = None
     download_url: str | None = None
     optimized: bool = False
+
+
+class ProductSummaryResponse(BaseModel):
+    """Return the local EasyCollect product-library list for the dashboard."""
+
+    products: list[dict[str, Any]]
+
+
+class BulkProductDeleteRequest(BaseModel):
+    """Delete multiple product-library rows by id."""
+
+    product_ids: list[str] = Field(default_factory=list)
 
 
 def dump_raw_payload(raw: Any) -> Path:
@@ -133,6 +152,88 @@ def dump_parsed_product(parsed_product: dict[str, Any]) -> Path:
         json.dump(parsed_product, file, indent=2, ensure_ascii=False, default=str)
 
     return PARSED_PRODUCT_PATH
+
+
+def infer_product_platform(product: dict[str, Any], source_file: str) -> str:
+    """Infer a product platform label from cached product content."""
+
+    explicit = product.get("platform")
+    if isinstance(explicit, str) and explicit.strip():
+        platform = explicit.strip().lower()
+        if "shopee" in platform:
+            return "Shopee"
+        if "1688" in platform:
+            return "1688"
+
+    image_blob = json.dumps(product.get("main_images", []), ensure_ascii=False)
+    if "shopee" in image_blob or "cf.shopee" in image_blob:
+        return "Shopee"
+    if "alicdn" in image_blob or "1688" in source_file:
+        return "1688"
+
+    return "Unknown"
+
+
+def product_cache_to_summary(cache_path: Path) -> dict[str, Any] | None:
+    """Convert a local product JSON cache file into dashboard row data."""
+
+    if not cache_path.exists():
+        return None
+
+    try:
+        with cache_path.open("r", encoding="utf-8") as file:
+            product = json.load(file)
+    except (OSError, json.JSONDecodeError) as exc:
+        logger.warning("Failed to read product cache %s: %s", cache_path, exc)
+        return None
+
+    if not isinstance(product, dict):
+        return None
+
+    title = (
+        product.get("title_optimized")
+        or product.get("title")
+        or product.get("source_title")
+        or "Untitled Product"
+    )
+    stat = cache_path.stat()
+
+    return {
+        "id": cache_path.stem,
+        "title": product.get("title") or title,
+        "title_optimized": product.get("title_optimized"),
+        "source_title": product.get("source_title"),
+        "platform": infer_product_platform(product, cache_path.name),
+        "base_price": product.get("base_price") or "",
+        "main_images": product.get("main_images") or [],
+        "sku_list": product.get("sku_list") or [],
+        "marketing_copy": product.get("marketing_copy"),
+        "bullet_points": product.get("bullet_points") or [],
+        "platform_tags": product.get("platform_tags") or [],
+        "source_file": cache_path.name,
+        "updated_at": datetime.fromtimestamp(stat.st_mtime).isoformat(timespec="seconds"),
+    }
+
+
+def list_local_product_summaries() -> list[dict[str, Any]]:
+    """Read current local product cache files for the dashboard MVP."""
+
+    cache_files = [
+        CACHE_DATA_DIR / "optimized_product.json",
+        CACHE_DATA_DIR / "parsed_product.json",
+    ]
+    products: list[dict[str, Any]] = []
+    seen_ids: set[str] = set()
+
+    for cache_path in cache_files:
+        product = product_cache_to_summary(cache_path)
+        if not product or product["id"] in seen_ids:
+            continue
+
+        seen_ids.add(product["id"])
+        products.append(product)
+
+    return products
 
 
 def safe_get(data: Any, path: list[str]) -> Any:
@@ -301,6 +402,204 @@ def normalize_price(value: Any) -> str | int | float | None:
     return None
 
 
+def normalize_shopee_price(value: Any) -> str | None:
+    """Convert Shopee integer price units into a human-readable decimal string.
+
+    Shopee item payloads commonly store prices multiplied by ``100000``. For
+    example, ``1639000`` represents ``16.39``.
+
+    Args:
+        value: Raw Shopee price value.
+
+    Returns:
+        Decimal price string, or ``None`` when unavailable.
+    """
+
+    if value in (None, "", [], {}):
+        return None
+
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+
+    if number <= 0:
+        return None
+
+    if number >= 100000:
+        number = number / 100000
+
+    return f"{number:.2f}".rstrip("0").rstrip(".")
+
+
+def normalize_shopee_price_range(price_min: Any, price_max: Any) -> str | None:
+    """Format Shopee min/max price fields as a compact price range string."""
+
+    min_price = normalize_shopee_price(price_min)
+    max_price = normalize_shopee_price(price_max)
+
+    if min_price and max_price and min_price != max_price:
+        return f"{min_price}-{max_price}"
+
+    return min_price or max_price
+
+
+def parse_standard_price(value: Any) -> float | None:
+    """Parse a normalized or raw marketplace price into a comparable float.
+
+    Shopee can expose raw integer prices multiplied by ``100000``. This helper
+    accepts already-normalized values such as ``15.90`` and raw values such as
+    ``1590000`` so downstream healing can compare prices safely.
+    """
+
+    if value in (None, "", [], {}):
+        return None
+
+    if isinstance(value, (int, float)):
+        number = float(value)
+    elif isinstance(value, str):
+        cleaned = value.strip().lower()
+        if cleaned in {"not found", "none", "null", "nan", "0", "0.0", "0.00"}:
+            return None
+
+        match = re.search(r"\d+(?:[.,]\d+)?", cleaned.replace(",", ""))
+        if not match:
+            return None
+
+        try:
+            number = float(match.group(0))
+        except ValueError:
+            return None
+    else:
+        return None
+
+    if number <= 0:
+        return None
+
+    if number >= 100000:
+        number = number / 100000
+
+    return number if number > 0 else None
+
+
+def format_standard_price(value: float) -> str:
+    """Format a marketplace price with two decimal places for cache and CSV."""
+
+    return f"{value:.2f}"
+
+
+def is_missing_base_price(value: Any) -> bool:
+    """Return whether a product-level price needs SKU-based self-healing."""
+
+    if value in (None, "", [], {}):
+        return True
+
+    if isinstance(value, str) and value.strip().lower() in {
+        "not found",
+        "none",
+        "null",
+        "nan",
+        "0",
+        "0.0",
+        "0.00",
+    }:
+        return True
+
+    return parse_standard_price(value) is None
+
+
+def normalize_base_price_value(value: Any) -> str:
+    """Normalize a base price or price range without losing range semantics."""
+
+    if isinstance(value, str) and "-" in value:
+        parts = [parse_standard_price(part) for part in value.split("-", 1)]
+        if parts[0] is not None and parts[1] is not None:
+            if parts[0] == parts[1]:
+                return format_standard_price(parts[0])
+            return f"{format_standard_price(parts[0])}-{format_standard_price(parts[1])}"
+
+    price = parse_standard_price(value)
+    return "" if price is None else format_standard_price(price)
+
+
+def heal_product_prices(clean_data: dict[str, Any]) -> dict[str, Any]:
+    """Normalize SKU prices and infer ``base_price`` from SKU rows when needed."""
+
+    sku_list = clean_data.get("sku_list")
+    if not isinstance(sku_list, list):
+        sku_list = []
+        clean_data["sku_list"] = sku_list
+
+    sku_prices: list[float] = []
+    for sku in sku_list:
+        if not isinstance(sku, dict):
+            continue
+
+        price = parse_standard_price(sku.get("price"))
+        if price is None:
+            sku["price"] = ""
+            continue
+
+        sku["price"] = format_standard_price(price)
+        sku_prices.append(price)
+
+    base_price = clean_data.get("base_price")
+    if is_missing_base_price(base_price) and sku_prices:
+        min_price = min(sku_prices)
+        max_price = max(sku_prices)
+        clean_data["base_price"] = (
+            format_standard_price(min_price)
+            if min_price == max_price
+            else f"{format_standard_price(min_price)}-{format_standard_price(max_price)}"
+        )
+    else:
+        normalized_base_price = normalize_base_price_value(base_price)
+        if normalized_base_price:
+            clean_data["base_price"] = normalized_base_price
+
+    return clean_data
+
+
+def infer_price_range_from_skus(sku_list: list[dict[str, Any]]) -> str | None:
+    """Infer a product price or price range from normalized SKU row prices."""
+
+    prices = [
+        price
+        for sku in sku_list
+        if isinstance(sku, dict)
+        for price in [parse_standard_price(sku.get("price"))]
+        if price is not None
+    ]
+    if not prices:
+        return None
+
+    min_price = min(prices)
+    max_price = max(prices)
+    if min_price == max_price:
+        return format_standard_price(min_price)
+
+    return f"{format_standard_price(min_price)}-{format_standard_price(max_price)}"
+
+
+def normalize_shopee_image(value: Any) -> str | None:
+    """Normalize a Shopee image ID or URL into an absolute image URL."""
+
+    if not isinstance(value, str):
+        return None
+
+    image = value.strip()
+    if not image:
+        return None
+
+    if image.startswith("//"):
+        return f"https:{image}"
+
+    if image.startswith(("http://", "https://")):
+        return image
+
+    return f"{SHOPEE_IMAGE_BASE_URL}{image}"
+
+
 def collect_image_urls(value: Any) -> list[str]:
     """Extract image URLs from strings, lists, and dictionary-shaped image nodes.
 
@@ -388,6 +687,74 @@ def normalize_spec_name(value: Any) -> str:
     return unescape(str(value)).strip()
 
 
+def normalize_lookup_key(value: Any) -> str:
+    """Normalize option/spec aliases for fuzzy SKU image lookup."""
+
+    return re.sub(r"\s+", " ", normalize_spec_name(value)).strip().lower()
+
+
+def normalize_coord_key(value: Any) -> str:
+    """Normalize 1688 property-value ids used for index-based SKU mapping."""
+
+    if value in (None, "", [], {}):
+        return ""
+
+    return str(value).strip()
+
+
+def extract_coord_keys(value: Any) -> list[str]:
+    """Extract possible 1688 property coordinate ids from strings/lists/dicts."""
+
+    keys: list[str] = []
+    seen: set[str] = set()
+
+    def remember(candidate: Any) -> None:
+        key = normalize_coord_key(candidate)
+        if key and key not in seen:
+            seen.add(key)
+            keys.append(key)
+
+    def add(candidate: Any) -> None:
+        text = normalize_coord_key(candidate)
+        if not text:
+            return
+
+        remember(text)
+        for token in re.split(r"[&;,|>\s]+", text):
+            remember(token)
+            for separator in [":", "="]:
+                if separator in token:
+                    right_side = token.rsplit(separator, 1)[-1]
+                    remember(right_side)
+
+    if isinstance(value, dict):
+        for key in [
+            "specId",
+            "specID",
+            "propId",
+            "propID",
+            "propIds",
+            "propValueId",
+            "propValueID",
+            "propertyValueId",
+            "propertyValueID",
+            "skuProps",
+            "skuPropIds",
+            "valueId",
+            "valueID",
+            "vid",
+            "id",
+        ]:
+            add(value.get(key))
+    elif isinstance(value, list):
+        for item in value:
+            add(item)
+    else:
+        add(value)
+
+    return keys
+
+
 def normalize_stock(value: Any) -> str:
     """Normalize SKU stock-like values into a display-friendly string.
 
@@ -423,7 +790,7 @@ def get_first_sku_value(sku: dict[str, Any], keys: list[str]) -> Any:
     return None
 
 
-def normalize_sku_row(spec_key: str, sku: dict[str, Any]) -> dict[str, str]:
+def normalize_sku_row(spec_key: str, sku: dict[str, Any]) -> dict[str, Any]:
     """Convert a raw 1688 SKU dictionary into the compact cache row shape.
 
     Args:
@@ -453,13 +820,35 @@ def normalize_sku_row(spec_key: str, sku: dict[str, Any]) -> dict[str, str]:
             [
                 "skuImage",
                 "skuImageUrl",
+                "skuImageURI",
+                "skuImageUri",
+                "sku_image",
+                "sku_image_url",
+                "sku_image_uri",
                 "image",
                 "imageUrl",
+                "imageURL",
+                "imageURI",
+                "imageUri",
+                "image_url",
+                "image_uri",
                 "picUrl",
+                "picURL",
+                "pic_url",
                 "fullPathImageURI",
+                "fullPathImageUri",
                 "originalImageURI",
+                "originalImageUri",
+                "originalImageUrl",
             ],
         )
+    )
+
+    coord_keys = extract_coord_keys(spec_key)
+    coord_keys.extend(
+        key
+        for key in extract_coord_keys(sku)
+        if key not in coord_keys
     )
 
     return {
@@ -467,10 +856,11 @@ def normalize_sku_row(spec_key: str, sku: dict[str, Any]) -> dict[str, str]:
         "price": "" if price is None else str(price),
         "stock": stock,
         "sku_image": sku_images[0] if sku_images else "",
+        "_coord_keys": coord_keys,
     }
 
 
-def normalize_sku_container(value: Any) -> list[dict[str, str]]:
+def normalize_sku_container(value: Any) -> list[dict[str, Any]]:
     """Normalize a SKU map or list from 1688 into compact parsed rows.
 
     Args:
@@ -481,7 +871,7 @@ def normalize_sku_container(value: Any) -> list[dict[str, str]]:
         A list of cleaned SKU rows.
     """
 
-    rows: list[dict[str, str]] = []
+    rows: list[dict[str, Any]] = []
     seen: set[tuple[str, str, str]] = set()
 
     def add_row(spec_key: str, sku: Any) -> None:
@@ -503,6 +893,461 @@ def normalize_sku_container(value: Any) -> list[dict[str, str]]:
     elif isinstance(value, list):
         for sku in value:
             add_row("", sku)
+
+    return rows
+
+
+def add_1688_sku_image_aliases(
+    image_map: dict[str, str],
+    aliases: list[Any],
+    image_value: Any,
+) -> None:
+    """Register SKU option aliases against the first discovered image URL."""
+
+    image_urls = collect_image_urls(image_value)
+    if not image_urls:
+        return
+
+    image_url = image_urls[0]
+    for alias in aliases:
+        lookup_key = normalize_lookup_key(alias)
+        if lookup_key and lookup_key not in image_map:
+            image_map[lookup_key] = image_url
+
+        for coord_key in extract_coord_keys(alias):
+            if coord_key and coord_key not in image_map:
+                image_map[coord_key] = image_url
+
+
+def iter_1688_sku_props(raw_data: Any) -> list[Any]:
+    """Return likely 1688 ``skuProps`` containers from known payload shapes."""
+
+    sku_props_paths = [
+        ["globalData", "skuModel", "skuProps"],
+        ["globalData", "model", "skuModel", "skuProps"],
+        ["globalData", "model", "tradeModel", "skuProps"],
+        ["result", "global", "globalData", "skuModel", "skuProps"],
+        ["result", "global", "globalData", "model", "skuModel", "skuProps"],
+        ["result", "global", "globalData", "model", "tradeModel", "skuProps"],
+        ["result", "data", "Root", "fields", "dataJson", "skuModel", "skuProps"],
+        ["result", "data", "Root", "fields", "dataJson", "skuProps"],
+        ["skuModel", "skuProps"],
+        ["skuProps"],
+    ]
+
+    containers: list[Any] = []
+    for path in sku_props_paths:
+        value = safe_get(raw_data, path)
+        if isinstance(value, list):
+            containers.append(value)
+
+    for value in find_values_by_key(raw_data, "skuProps"):
+        if isinstance(value, list):
+            containers.append(value)
+
+    return containers
+
+
+def build_1688_sku_props_image_map(raw_data: Any) -> dict[str, str]:
+    """Build a high-confidence 1688 option-name to image map from ``skuProps``."""
+
+    image_map: dict[str, str] = {}
+    alias_keys = [
+        "name",
+        "value",
+        "propValue",
+        "propValueName",
+        "valueName",
+        "specName",
+        "specValue",
+        "displayName",
+        "title",
+        "specId",
+        "specID",
+        "propId",
+        "propID",
+        "propValueId",
+        "propValueID",
+        "propertyValueId",
+        "propertyValueID",
+        "valueId",
+        "valueID",
+        "vid",
+        "id",
+    ]
+    image_keys = [
+        "imageUrl",
+        "imageURL",
+        "image_url",
+        "image",
+        "imageURI",
+        "imageUri",
+        "image_uri",
+        "skuImage",
+        "skuImageUrl",
+        "skuImageURL",
+        "skuImageURI",
+        "skuImageUri",
+        "sku_image",
+        "sku_image_url",
+        "sku_image_uri",
+        "picUrl",
+        "picURL",
+        "pic_url",
+        "fullPathImageURI",
+        "fullPathImageUri",
+        "full_path_image_uri",
+        "originalImageURI",
+        "originalImageUri",
+        "originalImageUrl",
+        "original_image_uri",
+        "original_image_url",
+    ]
+
+    for sku_props in iter_1688_sku_props(raw_data):
+        for prop_index, prop in enumerate(sku_props):
+            if not isinstance(prop, dict):
+                continue
+
+            prop_aliases = [
+                prop.get(key)
+                for key in [
+                    "fid",
+                    "id",
+                    "propId",
+                    "propID",
+                    "propertyId",
+                    "propertyID",
+                    "name",
+                    "propName",
+                ]
+                if prop.get(key) not in (None, "", [], {})
+            ]
+            values = (
+                prop.get("value")
+                or prop.get("values")
+                or prop.get("propertyValues")
+                or prop.get("propValues")
+                or prop.get("optionList")
+                or []
+            )
+            if isinstance(values, dict):
+                values = list(values.values())
+            if not isinstance(values, list):
+                continue
+
+            for option_index, option in enumerate(values):
+                if not isinstance(option, dict):
+                    continue
+
+                aliases = [
+                    option.get(key)
+                    for key in alias_keys
+                    if option.get(key) not in (None, "", [], {})
+                ]
+                image_value = next(
+                    (
+                        option.get(image_key)
+                        for image_key in image_keys
+                        if option.get(image_key) not in (None, "", [], {})
+                    ),
+                    None,
+                )
+                if image_value not in (None, "", [], {}):
+                    aliases.extend(
+                        [
+                            option_index,
+                            f"{prop_index}:{option_index}",
+                            *[
+                                f"{prop_alias}:{option.get(option_key)}"
+                                for prop_alias in prop_aliases
+                                for option_key in alias_keys
+                                if option.get(option_key) not in (None, "", [], {})
+                            ],
+                        ]
+                    )
+                    add_1688_sku_image_aliases(image_map, aliases, image_value)
+
+    return image_map
+
+
+def extract_1688_images_recursively(data: Any, image_map: dict[str, str]) -> None:
+    """Recursively sniff 1688 option image pairs from unstable skuModel shapes."""
+
+    name_keys = [
+        "name",
+        "value",
+        "propValue",
+        "propValueName",
+        "valueName",
+        "specName",
+        "specValue",
+        "displayName",
+        "title",
+    ]
+    id_keys = [
+        "specId",
+        "specID",
+        "propId",
+        "propID",
+        "propValueId",
+        "propValueID",
+        "propertyValueId",
+        "propertyValueID",
+        "valueId",
+        "valueID",
+        "vid",
+        "id",
+    ]
+    image_keys = [
+        "imageUrl",
+        "imageURL",
+        "image_url",
+        "image",
+        "imageURI",
+        "imageUri",
+        "image_uri",
+        "skuImage",
+        "skuImageUrl",
+        "skuImageURL",
+        "skuImageURI",
+        "skuImageUri",
+        "sku_image",
+        "sku_image_url",
+        "sku_image_uri",
+        "picUrl",
+        "picURL",
+        "pic_url",
+        "fullPathImageURI",
+        "fullPathImageUri",
+        "full_path_image_uri",
+        "originalImageURI",
+        "originalImageUri",
+        "originalImageUrl",
+        "original_image_uri",
+        "original_image_url",
+    ]
+
+    def walk(node: Any, inherited_aliases: list[Any] | None = None) -> None:
+        aliases = list(inherited_aliases or [])
+
+        if isinstance(node, dict):
+            local_aliases = [
+                node.get(key)
+                for key in name_keys + id_keys
+                if node.get(key) not in (None, "", [], {})
+            ]
+            aliases.extend(local_aliases)
+
+            image_value = next(
+                (
+                    node.get(key)
+                    for key in image_keys
+                    if node.get(key) not in (None, "", [], {})
+                ),
+                None,
+            )
+            if image_value not in (None, "", [], {}):
+                add_1688_sku_image_aliases(image_map, aliases, image_value)
+
+            for key, value in node.items():
+                if isinstance(value, str):
+                    urls = collect_image_urls(value)
+                    if urls:
+                        add_1688_sku_image_aliases(image_map, aliases + [key], value)
+                elif isinstance(value, (dict, list)):
+                    walk(value, aliases)
+        elif isinstance(node, list):
+            for index, item in enumerate(node):
+                walk(item, aliases + [index])
+
+    walk(data)
+
+
+def build_1688_sku_image_map(raw_data: Any) -> dict[str, str]:
+    """Build a best-effort map from 1688 spec names/specIds to SKU images.
+
+    1688 often keeps variation pictures in ``skuProps`` or image lookup tables
+    rather than inside each ``skuMap`` row. This recursive sniffer registers any
+    dictionary that contains both image-like fields and option identifiers.
+    """
+
+    image_map: dict[str, str] = build_1688_sku_props_image_map(raw_data)
+    for sku_model in find_values_by_key(raw_data, "skuModel"):
+        extract_1688_images_recursively(sku_model, image_map)
+    extract_1688_images_recursively(raw_data, image_map)
+    option_name_keys = [
+        "name",
+        "value",
+        "propValue",
+        "propValueName",
+        "valueName",
+        "specName",
+        "specAttrs",
+        "title",
+    ]
+    option_id_keys = [
+        "specId",
+        "specID",
+        "propId",
+        "propID",
+        "propValueId",
+        "propValueID",
+        "propertyValueId",
+        "propertyValueID",
+        "valueId",
+        "valueID",
+        "vid",
+        "id",
+        "skuId",
+        "skuID",
+    ]
+    image_keys = [
+        "image",
+        "imageUrl",
+        "imageURL",
+        "image_url",
+        "imageURI",
+        "imageUri",
+        "image_uri",
+        "skuImage",
+        "skuImageUrl",
+        "skuImageURL",
+        "skuImageURI",
+        "skuImageUri",
+        "sku_image",
+        "sku_image_url",
+        "sku_image_uri",
+        "picUrl",
+        "picURL",
+        "pic_url",
+        "fullPathImageURI",
+        "fullPathImageUri",
+        "full_path_image_uri",
+        "originalImageURI",
+        "originalImageUri",
+        "originalImageUrl",
+        "original_image_uri",
+        "original_image_url",
+    ]
+
+    def register_dict(node: dict[str, Any]) -> None:
+        aliases: list[Any] = []
+        for key in option_name_keys + option_id_keys:
+            value = node.get(key)
+            if value not in (None, "", [], {}):
+                aliases.append(value)
+
+        for key in image_keys:
+            value = node.get(key)
+            if value not in (None, "", [], {}):
+                add_1688_sku_image_aliases(image_map, aliases, value)
+
+    def walk(node: Any) -> None:
+        if isinstance(node, dict):
+            register_dict(node)
+
+            # Map-style image tables are common: {specId: "img/..."}.
+            for key, value in node.items():
+                if isinstance(value, str):
+                    urls = collect_image_urls(value)
+                    if urls:
+                        add_1688_sku_image_aliases(image_map, [key], value)
+
+            for value in node.values():
+                if isinstance(value, (dict, list)):
+                    walk(value)
+        elif isinstance(node, list):
+            for item in node:
+                if isinstance(item, (dict, list)):
+                    walk(item)
+
+    walk(raw_data)
+    return image_map
+
+
+def find_ordered_1688_sku_images(raw_data: Any, expected_count: int) -> list[str]:
+    """Find an ordered 1688 SKU image list for last-resort row assignment.
+
+    Some 1688 pages expose SKU option pictures as a plain ordered image array
+    rather than an aliasable ``specId -> image`` map. When alias lookup fails,
+    this helper tries high-confidence SKU image containers first, then falls
+    back to the product ``images`` array only if it has enough images to cover
+    the SKU rows.
+    """
+
+    candidate_paths = [
+        ["result", "data", "Root", "fields", "dataJson", "skuProps"],
+        ["result", "global", "globalData", "model", "skuProps"],
+        ["result", "global", "globalData", "skuProps"],
+        ["globalData", "skuProps"],
+        ["skuProps"],
+        ["skuImageMap"],
+        ["skuImages"],
+        ["skuImageList"],
+    ]
+
+    for path in candidate_paths:
+        images = collect_image_urls(safe_get(raw_data, path))
+        if len(images) >= expected_count:
+            return images
+
+    for key in ["skuProps", "skuImageMap", "skuImages", "skuImageList", "skuPropImages"]:
+        for value in find_values_by_key(raw_data, key):
+            images = collect_image_urls(value)
+            if len(images) >= expected_count:
+                return images
+
+    return []
+
+
+def attach_1688_sku_images(
+    rows: list[dict[str, Any]],
+    raw_data: dict[str, Any],
+) -> list[dict[str, str]]:
+    """Fill missing 1688 SKU images from real skuProps/spec image maps only."""
+
+    image_map = build_1688_sku_image_map(raw_data)
+    if not image_map:
+        return rows
+
+    for row in rows:
+        if row.get("sku_image"):
+            continue
+
+        for coord_key in row.get("_coord_keys", []):
+            image_url = image_map.get(normalize_coord_key(coord_key))
+            if image_url:
+                row["sku_image"] = image_url
+                break
+
+        if row.get("sku_image"):
+            continue
+
+        spec_name = row.get("spec_name", "")
+        lookup_keys = [normalize_lookup_key(spec_name)]
+        for part in spec_name.split(">"):
+            key = normalize_lookup_key(part)
+            if key:
+                lookup_keys.append(key)
+
+        for key in lookup_keys:
+            image_url = image_map.get(key)
+            if image_url:
+                row["sku_image"] = image_url
+                break
+
+        if row.get("sku_image"):
+            continue
+
+        normalized_spec = normalize_lookup_key(spec_name)
+        for alias, image_url in image_map.items():
+            if alias and (alias in normalized_spec or normalized_spec in alias):
+                row["sku_image"] = image_url
+                break
+
+    for row in rows:
+        row.pop("_coord_keys", None)
 
     return rows
 
@@ -547,17 +1392,421 @@ def extract_sku_list(raw_data: dict[str, Any]) -> list[dict[str, str]]:
     for path in sku_paths:
         rows = normalize_sku_container(safe_get(raw_data, path))
         if rows:
-            return rows
+            return attach_1688_sku_images(rows, raw_data)
 
     for key in ["skuInfoMap", "skuMap", "skuMapOriginal", "skuInfoMapOriginal"]:
         rows = normalize_sku_container(find_first_by_keys(raw_data, [key]))
         if rows:
-            return rows
+            return attach_1688_sku_images(rows, raw_data)
 
     return []
 
 
-def build_parsed_product(raw_data: Any, parsed: dict[str, Any]) -> dict[str, Any]:
+def score_shopee_item_node(node: dict[str, Any]) -> int:
+    """Score whether a dictionary looks like a Shopee item payload."""
+
+    score = 0
+    if isinstance(node.get("name"), str):
+        score += 40
+    if isinstance(node.get("images"), list):
+        score += 30
+    if isinstance(node.get("tier_variations"), list):
+        score += 40
+    if isinstance(node.get("models"), list):
+        score += 40
+    if node.get("itemid") or node.get("item_id"):
+        score += 20
+    if node.get("price") or node.get("price_min"):
+        score += 20
+    return score
+
+
+def find_best_shopee_item(raw_data: Any) -> dict[str, Any]:
+    """Find the most likely Shopee item object in a deep raw payload."""
+
+    direct_paths = [
+        ["data", "item"],
+        ["data", "item_info"],
+        ["data", "itemInfo"],
+        ["item"],
+        ["item_info"],
+        ["itemInfo"],
+    ]
+    for path in direct_paths:
+        value = safe_get(raw_data, path)
+        if isinstance(value, dict) and score_shopee_item_node(value) > 0:
+            return value
+
+    best: dict[str, Any] = {}
+    best_score = 0
+
+    def walk(node: Any) -> None:
+        nonlocal best, best_score
+
+        if isinstance(node, dict):
+            score = score_shopee_item_node(node)
+            if score > best_score:
+                best = node
+                best_score = score
+
+            for value in node.values():
+                if isinstance(value, (dict, list)):
+                    walk(value)
+        elif isinstance(node, list):
+            for item in node:
+                if isinstance(item, (dict, list)):
+                    walk(item)
+
+    walk(raw_data)
+    return best
+
+
+def get_shopee_item_data(raw_data: dict[str, Any]) -> dict[str, Any]:
+    """Return Shopee official item data from common API response wrappers."""
+
+    data_node = raw_data.get("data", raw_data)
+    if not isinstance(data_node, dict):
+        return find_best_shopee_item(raw_data)
+
+    item_node = data_node.get("item", data_node)
+    if isinstance(item_node, dict) and score_shopee_item_node(item_node) > 0:
+        return item_node
+
+    return find_best_shopee_item(raw_data)
+
+
+def extract_shopee_images(item: dict[str, Any]) -> list[str]:
+    """Extract Shopee main image URLs from item image IDs or URL strings."""
+
+    images: list[str] = []
+    seen: set[str] = set()
+
+    def add(raw_image: Any) -> None:
+        if isinstance(raw_image, dict):
+            raw_image = (
+                raw_image.get("image_id")
+                or raw_image.get("image")
+                or raw_image.get("url")
+            )
+
+        image_url = normalize_shopee_image(raw_image)
+        if image_url and image_url not in seen:
+            seen.add(image_url)
+            images.append(image_url)
+
+    raw_images = item.get("images")
+    if isinstance(raw_images, list):
+        for raw_image in raw_images:
+            add(raw_image)
+
+    if images:
+        return images
+
+    raw_image_list = item.get("image_list")
+    if isinstance(raw_image_list, list):
+        for raw_image in raw_image_list:
+            add(raw_image)
+
+    if images:
+        return images
+
+    add(item.get("image"))
+
+    return images
+
+
+def find_first_shopee_images_array(raw_data: Any) -> list[str]:
+    """Find and normalize the first Shopee ``images`` array in a raw payload."""
+
+    found: list[str] = []
+
+    def walk(node: Any) -> None:
+        nonlocal found
+        if found:
+            return
+
+        if isinstance(node, dict):
+            images_value = node.get("images")
+            if isinstance(images_value, list) and images_value:
+                found = extract_shopee_images({"images": images_value})
+                if found:
+                    return
+
+            for value in node.values():
+                if isinstance(value, (dict, list)):
+                    walk(value)
+                    if found:
+                        return
+        elif isinstance(node, list):
+            for item in node:
+                if isinstance(item, (dict, list)):
+                    walk(item)
+                    if found:
+                        return
+
+    walk(raw_data)
+    return found
+
+
+def get_tier_option_names(tier_variations: list[Any]) -> list[list[str]]:
+    """Return Shopee tier option names grouped by variation dimension."""
+
+    option_groups: list[list[str]] = []
+    for tier in tier_variations:
+        if not isinstance(tier, dict):
+            continue
+
+        options = tier.get("options") or tier.get("option_list") or []
+        names: list[str] = []
+        if isinstance(options, list):
+            for option in options:
+                if isinstance(option, dict):
+                    name = option.get("name") or option.get("option") or option.get("value")
+                else:
+                    name = option
+                names.append(normalize_spec_name(name))
+        option_groups.append(names)
+
+    return option_groups
+
+
+def get_tier_option_images(tier_variations: list[Any]) -> dict[tuple[int, int], str]:
+    """Map Shopee tier option indexes to variation image URLs when available."""
+
+    images: dict[tuple[int, int], str] = {}
+    for tier_index, tier in enumerate(tier_variations):
+        if not isinstance(tier, dict):
+            continue
+
+        options = tier.get("options") or tier.get("option_list") or []
+        option_images = tier.get("images") or tier.get("image_list") or []
+
+        if isinstance(options, list):
+            for option_index, option in enumerate(options):
+                raw_image = None
+                if isinstance(option, dict):
+                    raw_image = (
+                        option.get("image_id")
+                        or option.get("image")
+                        or option.get("image_url")
+                    )
+                image_url = normalize_shopee_image(raw_image)
+                if image_url:
+                    images[(tier_index, option_index)] = image_url
+
+        if isinstance(option_images, list):
+            for option_index, raw_image in enumerate(option_images):
+                if isinstance(raw_image, dict):
+                    raw_image = raw_image.get("image_id") or raw_image.get("image")
+                image_url = normalize_shopee_image(raw_image)
+                if image_url:
+                    images[(tier_index, option_index)] = image_url
+
+    return images
+
+
+def get_shopee_tier_indexes(model: dict[str, Any]) -> list[int]:
+    """Read Shopee model tier indexes from common payload locations."""
+
+    extinfo = model.get("extinfo")
+    tier_indexes = extinfo.get("tier_index") if isinstance(extinfo, dict) else None
+    if not isinstance(tier_indexes, list):
+        tier_indexes = model.get("tier_index")
+    if not isinstance(tier_indexes, list):
+        tier_indexes = model.get("tier_indexes")
+    if not isinstance(tier_indexes, list):
+        return []
+
+    return [index for index in tier_indexes if isinstance(index, int)]
+
+
+def get_tier_option_image_aliases(tier_variations: list[Any]) -> dict[str, str]:
+    """Map Shopee option names such as ``Black`` to their variation image."""
+
+    aliases: dict[str, str] = {}
+    option_groups = get_tier_option_names(tier_variations)
+    option_images = get_tier_option_images(tier_variations)
+
+    for (tier_index, option_index), image_url in option_images.items():
+        if tier_index >= len(option_groups):
+            continue
+        options = option_groups[tier_index]
+        if not (0 <= option_index < len(options)):
+            continue
+
+        option_name = options[option_index]
+        key = normalize_lookup_key(option_name)
+        if key:
+            aliases[key] = image_url
+
+    return aliases
+
+
+def build_shopee_model_spec(
+    model: dict[str, Any],
+    option_groups: list[list[str]],
+) -> str:
+    """Build a readable Shopee SKU spec name from model tier indexes."""
+
+    direct_name = normalize_spec_name(model.get("name") or model.get("model_name"))
+    if direct_name:
+        return direct_name
+
+    tier_indexes = get_shopee_tier_indexes(model)
+    if not tier_indexes:
+        return direct_name
+
+    parts: list[str] = []
+    for group_index, option_index in enumerate(tier_indexes):
+        if not isinstance(option_index, int):
+            continue
+        if group_index >= len(option_groups):
+            continue
+        options = option_groups[group_index]
+        if 0 <= option_index < len(options) and options[option_index]:
+            parts.append(options[option_index])
+
+    return " > ".join(parts) or direct_name
+
+
+def build_shopee_model_image(
+    model: dict[str, Any],
+    option_images: dict[tuple[int, int], str],
+    image_aliases: dict[str, str],
+    spec_name: str,
+) -> str:
+    """Resolve a Shopee variation image from model fields or tier option images."""
+
+    for key in ["image", "image_id", "image_url"]:
+        image_url = normalize_shopee_image(model.get(key))
+        if image_url:
+            return image_url
+
+    for group_index, option_index in enumerate(get_shopee_tier_indexes(model)):
+        image_url = option_images.get((group_index, option_index))
+        if image_url:
+            return image_url
+
+    spec_parts = [
+        normalize_lookup_key(part)
+        for part in re.split(r"\s*>\s*|[;；|/，,、]+", spec_name)
+        if normalize_lookup_key(part)
+    ]
+    for part in spec_parts:
+        image_url = image_aliases.get(part)
+        if image_url:
+            return image_url
+
+    normalized_spec = normalize_lookup_key(spec_name)
+    for alias, image_url in image_aliases.items():
+        if alias and alias in normalized_spec:
+            return image_url
+
+    return ""
+
+
+def extract_shopee_sku_list(item: dict[str, Any]) -> list[dict[str, str]]:
+    """Extract Shopee SKU rows from tier variations and model combinations."""
+
+    tier_variations = item.get("tier_variations") or []
+    models = item.get("models") or []
+    option_groups = get_tier_option_names(tier_variations if isinstance(tier_variations, list) else [])
+    option_images = get_tier_option_images(tier_variations if isinstance(tier_variations, list) else [])
+    image_aliases = get_tier_option_image_aliases(tier_variations if isinstance(tier_variations, list) else [])
+
+    rows: list[dict[str, str]] = []
+    if isinstance(models, list):
+        for model in models:
+            if not isinstance(model, dict):
+                continue
+
+            spec_name = build_shopee_model_spec(model, option_groups)
+            price_value = model.get("price")
+            price_stocks = model.get("price_stocks")
+            if price_value in (None, "", 0) and isinstance(price_stocks, list) and price_stocks:
+                first_price_stock = price_stocks[0]
+                if isinstance(first_price_stock, dict):
+                    price_value = first_price_stock.get("price")
+
+            price = normalize_shopee_price(price_value)
+            stock = normalize_stock(
+                model.get("stock")
+                or model.get("normal_stock")
+                or model.get("current_stock")
+            )
+            sku_image = build_shopee_model_image(model, option_images, image_aliases, spec_name)
+
+            if spec_name:
+                rows.append(
+                    {
+                        "spec_name": spec_name,
+                        "price": price or "",
+                        "stock": stock,
+                        "sku_image": sku_image,
+                    }
+                )
+
+    if rows:
+        return rows
+
+    fallback_price = normalize_shopee_price(item.get("price"))
+    if fallback_price is None:
+        fallback_price = normalize_shopee_price(item.get("price_min") or item.get("price_max"))
+
+    fallback_images = extract_shopee_images(item)
+    return [
+        {
+            "spec_name": "Default",
+            "price": fallback_price or "",
+            "stock": normalize_stock(
+                item.get("stock")
+                or item.get("normal_stock")
+                or item.get("current_stock")
+                or item.get("historical_sold")
+            ),
+            "sku_image": fallback_images[0] if fallback_images else "",
+        }
+    ]
+
+
+def extract_shopee_data(raw_data: dict[str, Any]) -> dict[str, Any]:
+    """Extract EasyCollect-standard product data from Shopee raw payload.
+
+    This parser deliberately prioritizes the official ``item.images`` array for
+    carousel images. Shopee also exposes single cover image fields, but those are
+    used only as a last fallback so the export package keeps the full gallery.
+    """
+
+    item_data = get_shopee_item_data(raw_data)
+    title = normalize_title(item_data.get("name") or item_data.get("title"))
+    main_images = extract_shopee_images(item_data) or find_first_shopee_images_array(raw_data)
+    sku_list = extract_shopee_sku_list(item_data)
+
+    price = normalize_shopee_price(item_data.get("price"))
+    if price is None:
+        price = normalize_shopee_price_range(
+            item_data.get("price_min"),
+            item_data.get("price_max"),
+        )
+    if is_missing_base_price(price):
+        price = infer_price_range_from_skus(sku_list)
+
+    if not main_images:
+        main_images = collect_image_urls(raw_data)
+
+    return {
+        "title": title or "",
+        "base_price": "" if price is None else str(price),
+        "main_images": main_images,
+        "sku_list": sku_list,
+    }
+
+
+def build_parsed_product(
+    raw_data: Any,
+    parsed: dict[str, Any],
+    sku_list_override: list[dict[str, str]] | None = None,
+) -> dict[str, Any]:
     """Build the compact product JSON saved beside the raw capture.
 
     Args:
@@ -568,7 +1817,11 @@ def build_parsed_product(raw_data: Any, parsed: dict[str, Any]) -> dict[str, Any
         A normalized dictionary matching ``parsed_product.json`` requirements.
     """
 
-    sku_list = extract_sku_list(raw_data) if isinstance(raw_data, dict) else []
+    sku_list = (
+        sku_list_override
+        if sku_list_override is not None
+        else extract_sku_list(raw_data) if isinstance(raw_data, dict) else []
+    )
 
     return {
         "title": parsed.get("title") or "",
@@ -949,6 +2202,40 @@ def parse_raw_product(raw: Any) -> dict[str, Any]:
     }
 
 
+def normalize_platform(source: str | None, platform: str | None, url: str | None) -> str:
+    """Normalize the frontend platform marker into an internal route key."""
+
+    for value in [platform, source, url]:
+        if not value:
+            continue
+
+        lowered = value.lower()
+        if "shopee" in lowered:
+            return "shopee"
+        if "1688" in lowered:
+            return "1688"
+
+    return "1688"
+
+
+def parse_product_by_platform(
+    raw: Any,
+    platform: str,
+) -> dict[str, Any]:
+    """Route raw product payloads to the correct marketplace parser."""
+
+    if platform == "shopee" and isinstance(raw, dict):
+        return extract_shopee_data(raw)
+
+    parsed = parse_raw_product(raw)
+    return {
+        "title": parsed.get("title") or "",
+        "base_price": "" if parsed.get("price") is None else str(parsed.get("price")),
+        "main_images": parsed.get("images") or [],
+        "sku_list": extract_sku_list(raw) if isinstance(raw, dict) else [],
+    }
+
+
 def create_app() -> FastAPI:
     """Create and configure the EasyCollect FastAPI application.
 
@@ -984,8 +2271,10 @@ def create_app() -> FastAPI:
     )
 
     app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
+    product_store.init_product_db()
     app.include_router(export_router)
     app.include_router(optimize_router)
+    app.include_router(shopee_router)
 
     @app.get("/health", response_model=HealthResponse)
     async def health_check() -> HealthResponse:
@@ -1005,10 +2294,70 @@ def create_app() -> FastAPI:
             static_url="/static",
         )
 
+    @app.get("/api/products", response_model=ProductSummaryResponse)
+    async def list_products(platform: str | None = None) -> ProductSummaryResponse:
+        """Return locally cached parsed/optimized products for the dashboard."""
+
+        products = product_store.list_products(platform)
+        if not products and platform is None:
+            products = list_local_product_summaries()
+        return ProductSummaryResponse(products=products)
+
+    @app.delete("/api/products/bulk")
+    async def delete_products_bulk(request: BulkProductDeleteRequest) -> JSONResponse:
+        """Delete selected product-library rows in one request."""
+
+        clean_ids = [product_id for product_id in request.product_ids if product_id]
+        if not clean_ids:
+            raise HTTPException(status_code=400, detail="请选择要删除的商品")
+
+        deleted_count = product_store.delete_products(clean_ids)
+        return JSONResponse(
+            content={
+                "status": "success",
+                "deleted_count": deleted_count,
+                "message": f"已删除 {deleted_count} 个商品",
+            },
+            media_type="application/json; charset=utf-8",
+        )
+
+    @app.delete("/api/products/clear")
+    async def clear_products() -> JSONResponse:
+        """Clear every product-library row from the local SQLite inbox."""
+
+        deleted_count = product_store.clear_products()
+        return JSONResponse(
+            content={
+                "status": "success",
+                "deleted_count": deleted_count,
+                "message": "商品库已清空",
+            },
+            media_type="application/json; charset=utf-8",
+        )
+
+    @app.delete("/api/products/{product_id}")
+    async def delete_product(product_id: str) -> dict[str, str]:
+        """Delete one local product cache file by dashboard row id."""
+
+        if product_store.delete_product(product_id):
+            return {"status": "success", "msg": "Product deleted."}
+
+        allowed_files = {
+            "parsed_product": PARSED_PRODUCT_PATH,
+            "optimized_product": CACHE_DATA_DIR / "optimized_product.json",
+        }
+        cache_path = allowed_files.get(product_id)
+        if cache_path is None:
+            raise HTTPException(status_code=404, detail="Product cache not found.")
+
+        if cache_path.exists():
+            cache_path.unlink()
+
+        return {"status": "success", "msg": "Product deleted."}
+
     @app.post("/api/collect", response_model=CollectResponse)
     async def collect_product(
         payload: CollectRequest,
-        background_tasks: BackgroundTasks,
     ) -> CollectResponse:
         """Accept raw product detail data captured from a marketplace page.
 
@@ -1026,52 +2375,64 @@ def create_app() -> FastAPI:
         """
 
         raw_file = dump_raw_payload(payload.raw)
-        parsed = parse_raw_product(payload.raw)
+        platform = normalize_platform(payload.source, payload.platform, payload.url)
+        parsed_product = parse_product_by_platform(payload.raw, platform)
+        heal_product_prices(parsed_product)
 
-        title = parsed["title"] or payload.title
-        images = parsed["images"] or payload.images
-        price = parsed["price"]
-        parsed_product = build_parsed_product(
-            payload.raw,
-            {
-                "title": title,
-                "images": images,
-                "price": price,
-            },
-        )
+        title = parsed_product.get("title") or payload.title
+        images = parsed_product.get("main_images") or payload.images
+        price = parsed_product.get("base_price")
+        parsed_product["title"] = title or ""
+        parsed_product["main_images"] = images
+        parsed_product["base_price"] = "" if price is None else str(price)
+        heal_product_prices(parsed_product)
         parsed_file = dump_parsed_product(parsed_product)
         if payload.ai_mode:
-            product_for_export, optimized = await optimize_product_for_export(parsed_product)
+            product_for_storage, optimized = await optimize_product_for_export(parsed_product)
         else:
-            product_for_export, optimized = parsed_product, False
+            product_for_storage, optimized = parsed_product, False
 
-        export_package = await build_export_package(product_for_export, optimized=optimized)
-        background_tasks.add_task(cleanup_export_later, [export_package.zip_path])
+        product_for_storage.setdefault("source_title", parsed_product.get("title", ""))
+        product_for_storage.setdefault("base_price", parsed_product.get("base_price", ""))
+        product_for_storage.setdefault("main_images", parsed_product.get("main_images", []))
+        product_for_storage.setdefault("sku_list", parsed_product.get("sku_list", []))
+        product_for_storage["platform"] = platform
+        product_id = product_store.save_product(
+            product_for_storage,
+            raw=payload.raw,
+            platform=platform,
+        )
 
         logger.info("Received EasyCollect payload from %s", payload.source)
+        logger.info("Platform: %s", platform)
         logger.info("URL: %s", payload.url)
         logger.info("Data key: %s", payload.dataKey or "unknown")
         logger.info("AI mode: %s", payload.ai_mode)
         logger.info("Raw payload saved: %s", raw_file)
         logger.info("Parsed product saved: %s", parsed_file)
-        logger.info("Agent optimized export: %s", optimized)
-        logger.info("Export package URL: %s", export_package.download_url)
+        logger.info("Agent optimized product: %s", optimized)
+        logger.info("Product library id: %s", product_id)
         logger.info("Title: %s", title or "not found")
         logger.info("Price: %s", price or "not found")
         logger.info("Images: %s", images[:10])
         logger.info("Image count: %s", len(images))
         logger.info("SKU count: %s", len(parsed_product["sku_list"]))
 
-        return CollectResponse(
-            status="success",
-            msg="数据接收成功",
-            title=title,
-            images=images,
-            price=price,
-            raw_file=str(raw_file),
-            parsed_file=str(parsed_file),
-            download_url=export_package.download_url,
-            optimized=optimized,
+        response_content = {
+            "status": "success",
+            "msg": "商品已成功入库！",
+            "message": "商品已成功入库！",
+            "title": title,
+            "images": images,
+            "price": price,
+            "product_id": product_id,
+            "raw_file": str(raw_file),
+            "parsed_file": str(parsed_file),
+            "optimized": optimized,
+        }
+        return JSONResponse(
+            content=response_content,
+            media_type="application/json; charset=utf-8",
         )
 
     return app
