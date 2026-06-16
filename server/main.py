@@ -1777,6 +1777,55 @@ def fill_shopee_sku_image_fallbacks(
     return sku_list
 
 
+def shopee_sku_identity(model: dict[str, Any], spec_name: str) -> str:
+    """Return a stable dedupe key for one Shopee model row."""
+
+    for key in ["modelid", "model_id", "id", "sku_id", "skuId"]:
+        value = model.get(key)
+        if value not in (None, "", [], {}):
+            return f"id:{value}"
+
+    tier_indexes = get_shopee_tier_indexes(model)
+    if tier_indexes:
+        return "tier:" + "_".join(str(index) for index in tier_indexes)
+
+    return "spec:" + normalize_lookup_key(spec_name)
+
+
+def dedupe_sku_rows(sku_list: list[dict[str, str]]) -> list[dict[str, str]]:
+    """Remove duplicate SKU rows while preserving the first useful row."""
+
+    deduped: dict[str, dict[str, str]] = {}
+    for sku in sku_list:
+        if not isinstance(sku, dict):
+            continue
+
+        spec_name = normalize_spec_name(sku.get("spec_name")) or "Default"
+        price = str(sku.get("price") or "").strip()
+        stock = str(sku.get("stock") or "").strip()
+        sku_image = str(sku.get("sku_image") or "").strip()
+        key = normalize_lookup_key(spec_name) or f"{price}|{stock}|{sku_image}"
+
+        if key not in deduped:
+            deduped[key] = {
+                "spec_name": spec_name,
+                "price": price,
+                "stock": stock,
+                "sku_image": sku_image,
+            }
+            continue
+
+        existing = deduped[key]
+        if not existing.get("price") and price:
+            existing["price"] = price
+        if not existing.get("stock") and stock:
+            existing["stock"] = stock
+        if not existing.get("sku_image") and sku_image:
+            existing["sku_image"] = sku_image
+
+    return list(deduped.values())
+
+
 def extract_shopee_sku_list(item: dict[str, Any]) -> list[dict[str, str]]:
     """Extract Shopee SKU rows from tier variations and model combinations."""
 
@@ -1787,12 +1836,18 @@ def extract_shopee_sku_list(item: dict[str, Any]) -> list[dict[str, str]]:
     image_aliases = get_tier_option_image_aliases(tier_variations if isinstance(tier_variations, list) else [])
 
     rows: list[dict[str, str]] = []
+    processed_skus: set[str] = set()
     if isinstance(models, list):
         for model in models:
             if not isinstance(model, dict):
                 continue
 
             spec_name = build_shopee_model_spec(model, option_groups)
+            sku_key = shopee_sku_identity(model, spec_name)
+            if sku_key in processed_skus:
+                continue
+            processed_skus.add(sku_key)
+
             price_value = (
                 model.get("price")
                 or model.get("price_before_discount")
@@ -1830,12 +1885,12 @@ def extract_shopee_sku_list(item: dict[str, Any]) -> list[dict[str, str]]:
                 )
 
     if rows:
-        return rows
+        return dedupe_sku_rows(rows)
 
     fallback_price = extract_shopee_base_price(item)
 
     fallback_images = extract_shopee_images(item)
-    return [
+    return dedupe_sku_rows([
         {
             "spec_name": "Default",
             "price": fallback_price or "",
@@ -1847,7 +1902,7 @@ def extract_shopee_sku_list(item: dict[str, Any]) -> list[dict[str, str]]:
             ),
             "sku_image": fallback_images[0] if fallback_images else "",
         }
-    ]
+    ])
 
 
 def extract_shopee_data(raw_data: dict[str, Any]) -> dict[str, Any]:
@@ -1870,11 +1925,18 @@ def extract_shopee_data(raw_data: dict[str, Any]) -> dict[str, Any]:
     if is_missing_base_price(price):
         price = infer_price_range_from_skus(sku_list)
 
-    return {
+    clean_data = {
         "title": title or "",
         "base_price": "" if price is None else str(price),
         "main_images": main_images,
-        "sku_list": sku_list,
+        "sku_list": dedupe_sku_rows(sku_list),
+    }
+    heal_product_prices(clean_data)
+    return {
+        "title": clean_data["title"],
+        "base_price": clean_data["base_price"],
+        "main_images": clean_data["main_images"],
+        "sku_list": clean_data["sku_list"],
     }
 
 

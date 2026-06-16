@@ -205,16 +205,39 @@ def get_main_images(product: dict[str, Any]) -> list[str]:
 
 
 def get_sku_list(product: dict[str, Any]) -> list[dict[str, Any]]:
-    """Read product SKU rows from parsed or optimized data.
+    """Read and de-duplicate product SKU rows from parsed or optimized data.
 
     Args:
         product: Product JSON loaded from local cache.
 
     Returns:
-        List of SKU dictionaries.
+        Ordered list of SKU dictionaries.
     """
 
-    return [sku for sku in product.get("sku_list", []) if isinstance(sku, dict)]
+    deduped: dict[str, dict[str, Any]] = {}
+    for index, sku in enumerate(product.get("sku_list", [])):
+        if not isinstance(sku, dict):
+            continue
+
+        spec_name = str(sku.get("spec_name") or "").strip()
+        key = spec_name.lower() or f"row-{index}"
+        row = {
+            "spec_name": spec_name,
+            "price": sku.get("price", ""),
+            "stock": sku.get("stock", ""),
+            "sku_image": sku.get("sku_image", ""),
+        }
+
+        if key not in deduped:
+            deduped[key] = row
+            continue
+
+        existing = deduped[key]
+        for field in ["price", "stock", "sku_image"]:
+            if not existing.get(field) and row.get(field):
+                existing[field] = row[field]
+
+    return list(deduped.values())
 
 
 def get_base_price(product: dict[str, Any]) -> str:
