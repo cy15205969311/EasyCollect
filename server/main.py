@@ -2581,10 +2581,12 @@ def create_app() -> FastAPI:
         product_for_storage.setdefault("main_images", parsed_product.get("main_images", []))
         product_for_storage.setdefault("sku_list", parsed_product.get("sku_list", []))
         product_for_storage["platform"] = platform
+        product_for_storage["source_url"] = payload.url
         product_id = product_store.save_product(
             product_for_storage,
             raw=payload.raw,
             platform=platform,
+            source_url=payload.url,
         )
 
         logger.info("Received EasyCollect payload from %s", payload.source)
