@@ -444,6 +444,48 @@ def normalize_shopee_price_range(price_min: Any, price_max: Any) -> str | None:
     return min_price or max_price
 
 
+def extract_shopee_base_price(item: dict[str, Any]) -> str | None:
+    """Extract Shopee product-level price from common single/range fields."""
+
+    for key in [
+        "price",
+        "price_before_discount",
+        "raw_price",
+        "current_price",
+        "min_price",
+        "max_price",
+    ]:
+        price = normalize_shopee_price(item.get(key))
+        if price:
+            return price
+
+    range_candidates = [
+        ("price_min", "price_max"),
+        ("min_price", "max_price"),
+        ("price_min_before_discount", "price_max_before_discount"),
+    ]
+    for min_key, max_key in range_candidates:
+        price_range = normalize_shopee_price_range(item.get(min_key), item.get(max_key))
+        if price_range:
+            return price_range
+
+    price_stocks = item.get("price_stocks")
+    if isinstance(price_stocks, list):
+        for price_stock in price_stocks:
+            if not isinstance(price_stock, dict):
+                continue
+
+            price = normalize_shopee_price(
+                price_stock.get("price")
+                or price_stock.get("current_price")
+                or price_stock.get("price_before_discount")
+            )
+            if price:
+                return price
+
+    return None
+
+
 def parse_standard_price(value: Any) -> float | None:
     """Parse a normalized or raw marketplace price into a comparable float.
 
@@ -1589,6 +1631,9 @@ def get_tier_option_images(tier_variations: list[Any]) -> dict[tuple[int, int], 
                         option.get("image_id")
                         or option.get("image")
                         or option.get("image_url")
+                        or option.get("imageUrl")
+                        or option.get("cover")
+                        or option.get("thumbnail")
                     )
                 image_url = normalize_shopee_image(raw_image)
                 if image_url:
@@ -1677,7 +1722,17 @@ def build_shopee_model_image(
 ) -> str:
     """Resolve a Shopee variation image from model fields or tier option images."""
 
-    for key in ["image", "image_id", "image_url"]:
+    for key in [
+        "image",
+        "image_id",
+        "image_url",
+        "model_image",
+        "model_image_id",
+        "cover",
+        "cover_image",
+        "thumb",
+        "thumbnail",
+    ]:
         image_url = normalize_shopee_image(model.get(key))
         if image_url:
             return image_url
@@ -1705,6 +1760,23 @@ def build_shopee_model_image(
     return ""
 
 
+def fill_shopee_sku_image_fallbacks(
+    sku_list: list[dict[str, str]],
+    main_images: list[str],
+) -> list[dict[str, str]]:
+    """Ensure Shopee SKU rows always have an image when a main image exists."""
+
+    if not main_images:
+        return sku_list
+
+    fallback_image = main_images[0]
+    for sku in sku_list:
+        if isinstance(sku, dict) and not sku.get("sku_image"):
+            sku["sku_image"] = fallback_image
+
+    return sku_list
+
+
 def extract_shopee_sku_list(item: dict[str, Any]) -> list[dict[str, str]]:
     """Extract Shopee SKU rows from tier variations and model combinations."""
 
@@ -1721,12 +1793,23 @@ def extract_shopee_sku_list(item: dict[str, Any]) -> list[dict[str, str]]:
                 continue
 
             spec_name = build_shopee_model_spec(model, option_groups)
-            price_value = model.get("price")
+            price_value = (
+                model.get("price")
+                or model.get("price_before_discount")
+                or model.get("raw_price")
+                or model.get("current_price")
+                or model.get("price_min")
+                or model.get("price_max")
+            )
             price_stocks = model.get("price_stocks")
             if price_value in (None, "", 0) and isinstance(price_stocks, list) and price_stocks:
                 first_price_stock = price_stocks[0]
                 if isinstance(first_price_stock, dict):
-                    price_value = first_price_stock.get("price")
+                    price_value = (
+                        first_price_stock.get("price")
+                        or first_price_stock.get("current_price")
+                        or first_price_stock.get("price_before_discount")
+                    )
 
             price = normalize_shopee_price(price_value)
             stock = normalize_stock(
@@ -1749,9 +1832,7 @@ def extract_shopee_sku_list(item: dict[str, Any]) -> list[dict[str, str]]:
     if rows:
         return rows
 
-    fallback_price = normalize_shopee_price(item.get("price"))
-    if fallback_price is None:
-        fallback_price = normalize_shopee_price(item.get("price_min") or item.get("price_max"))
+    fallback_price = extract_shopee_base_price(item)
 
     fallback_images = extract_shopee_images(item)
     return [
@@ -1781,18 +1862,13 @@ def extract_shopee_data(raw_data: dict[str, Any]) -> dict[str, Any]:
     title = normalize_title(item_data.get("name") or item_data.get("title"))
     main_images = extract_shopee_images(item_data) or find_first_shopee_images_array(raw_data)
     sku_list = extract_shopee_sku_list(item_data)
-
-    price = normalize_shopee_price(item_data.get("price"))
-    if price is None:
-        price = normalize_shopee_price_range(
-            item_data.get("price_min"),
-            item_data.get("price_max"),
-        )
-    if is_missing_base_price(price):
-        price = infer_price_range_from_skus(sku_list)
-
     if not main_images:
         main_images = collect_image_urls(raw_data)
+    fill_shopee_sku_image_fallbacks(sku_list, main_images)
+
+    price = extract_shopee_base_price(item_data)
+    if is_missing_base_price(price):
+        price = infer_price_range_from_skus(sku_list)
 
     return {
         "title": title or "",
